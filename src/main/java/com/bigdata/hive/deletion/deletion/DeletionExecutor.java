@@ -158,13 +158,32 @@ public class DeletionExecutor {
         logger.info("Batch: {} records before, {} to retain, {} to delete",
                 recordsBefore, recordsToRetain, recordsBefore - recordsToRetain);
 
-        // Overwrite partitions with retained data using dynamic partition mode
-        // Note: Don't use partitionBy() with insertInto() - table is already
-        // partitioned
-        dataToRetain.write()
-                .mode(SaveMode.Overwrite)
-                .format("orc")
-                .insertInto(config.getFullTableName());
+        // Handle partitions based on whether they need to be emptied or partially
+        // deleted
+        if (recordsToRetain == 0) {
+            // When entire partition needs to be emptied, drop the partition
+            // Overwriting with empty dataset doesn't work reliably in Spark
+            logger.info("Entire partition(s) will be emptied - dropping partition(s)");
+            for (String partition : partitionBatch) {
+                String dropPartitionSql = String.format(
+                        "ALTER TABLE %s DROP IF EXISTS PARTITION (%s='%s')",
+                        config.getFullTableName(),
+                        config.getPartitionColumn(),
+                        partition);
+
+                logger.info("Executing: {}", dropPartitionSql);
+                spark.sql(dropPartitionSql);
+                auditLogger.info("PARTITION_DROPPED - Partition: {}={}",
+                        config.getPartitionColumn(), partition);
+            }
+        } else {
+            // Partial deletion - overwrite partition with retained data
+            logger.info("Partial deletion - overwriting partition(s) with retained data");
+            dataToRetain.write()
+                    .mode(SaveMode.Overwrite)
+                    .format("orc")
+                    .insertInto(config.getFullTableName());
+        }
 
         // Record metrics for each partition
         for (String partition : partitionBatch) {
