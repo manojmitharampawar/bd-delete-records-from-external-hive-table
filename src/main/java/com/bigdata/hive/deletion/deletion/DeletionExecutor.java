@@ -1,5 +1,8 @@
 package com.bigdata.hive.deletion.deletion;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SaveMode;
@@ -161,20 +164,53 @@ public class DeletionExecutor {
         // Handle partitions based on whether they need to be emptied or partially
         // deleted
         if (recordsToRetain == 0) {
-            // When entire partition needs to be emptied, drop the partition
-            // Overwriting with empty dataset doesn't work reliably in Spark
-            logger.info("Entire partition(s) will be emptied - dropping partition(s)");
-            for (String partition : partitionBatch) {
-                String dropPartitionSql = String.format(
-                        "ALTER TABLE %s DROP IF EXISTS PARTITION (%s='%s')",
-                        config.getFullTableName(),
-                        config.getPartitionColumn(),
-                        partition);
+            // When entire partition needs to be emptied, drop the partition metadata
+            // and delete the actual data files from HDFS (for external tables)
+            logger.info("Entire partition(s) will be emptied - dropping partition(s) and deleting data");
 
-                logger.info("Executing: {}", dropPartitionSql);
-                spark.sql(dropPartitionSql);
-                auditLogger.info("PARTITION_DROPPED - Partition: {}={}",
-                        config.getPartitionColumn(), partition);
+            for (String partition : partitionBatch) {
+                try {
+                    // Get partition location before dropping
+                    String partitionLocationSql = String.format(
+                            "DESCRIBE FORMATTED %s PARTITION (%s='%s')",
+                            config.getFullTableName(),
+                            config.getPartitionColumn(),
+                            partition);
+
+                    Dataset<Row> partitionInfo = spark.sql(partitionLocationSql);
+                    String partitionLocation = partitionInfo
+                            .filter("col_name = 'Location'")
+                            .select("data_type")
+                            .first()
+                            .getString(0);
+
+                    logger.info("Partition location: {}", partitionLocation);
+
+                    // Drop partition metadata from Hive metastore
+                    String dropPartitionSql = String.format(
+                            "ALTER TABLE %s DROP IF EXISTS PARTITION (%s='%s')",
+                            config.getFullTableName(),
+                            config.getPartitionColumn(),
+                            partition);
+
+                    logger.info("Executing: {}", dropPartitionSql);
+                    spark.sql(dropPartitionSql);
+                    auditLogger.info("PARTITION_DROPPED - Partition: {}={}",
+                            config.getPartitionColumn(), partition);
+
+                    // Delete actual data files from HDFS
+                    if (partitionLocation != null && !partitionLocation.isEmpty()) {
+                        deleteHdfsDirectory(partitionLocation);
+                        logger.info("Deleted HDFS directory: {}", partitionLocation);
+                        auditLogger.info("HDFS_DELETED - Location: {}", partitionLocation);
+                    }
+
+                } catch (Exception e) {
+                    logger.error("Error dropping partition and deleting data for partition: {}", partition, e);
+                    auditLogger.error("PARTITION_DELETE_FAILED - Partition: {}={}, Error: {}",
+                            config.getPartitionColumn(), partition, e.getMessage());
+                    throw new RuntimeException("Failed to drop partition and delete data: " + partition, e);
+                }
             }
         } else {
             // Partial deletion - overwrite partition with retained data
@@ -205,5 +241,30 @@ public class DeletionExecutor {
         }
 
         return batches;
+    }
+
+    /**
+     * Deletes a directory from HDFS.
+     * 
+     * @param hdfsPath The HDFS path to delete
+     */
+    private void deleteHdfsDirectory(String hdfsPath) throws Exception {
+        Configuration hadoopConf = spark.sparkContext().hadoopConfiguration();
+        FileSystem fs = FileSystem.get(hadoopConf);
+
+        Path path = new Path(hdfsPath);
+
+        if (fs.exists(path)) {
+            boolean deleted = fs.delete(path, true); // true = recursive delete
+            if (deleted) {
+                logger.info("Successfully deleted HDFS directory: {}", hdfsPath);
+            } else {
+                logger.warn("Failed to delete HDFS directory: {}", hdfsPath);
+            }
+        } else {
+            logger.warn("HDFS directory does not exist: {}", hdfsPath);
+        }
+
+        fs.close();
     }
 }
